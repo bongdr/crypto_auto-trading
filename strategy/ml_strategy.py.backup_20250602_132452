@@ -1,0 +1,310 @@
+# 3. strategy/ml_strategy.py 수정 - 최소 데이터 요구량 완화
+import pandas as pd
+import numpy as np
+import os
+import joblib
+from strategy.base import BaseStrategy
+from utils.logger import setup_logger
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+
+logger = setup_logger("ml_strategy")
+
+class MLStrategy(BaseStrategy):
+    """머신러닝 기반 매매 전략 - 개선된 버전"""
+    
+    def __init__(self, name="머신러닝 전략", model_path=None, model_type='random_forest'):
+        super().__init__(name)
+        self.model = None
+        self.scaler = StandardScaler()
+        self.model_path = model_path
+        self.model_type = model_type
+        self.feature_cols = []  # 학습에 사용한 특성 저장
+        
+        # 모델 로드 (있으면)
+        if model_path and os.path.exists(model_path):
+            self.load_model(model_path)
+    
+    def prepare_features(self, df):
+        """모델 학습/예측을 위한 특성 준비"""
+        # 기존 특성이 충분한지 확인
+        required_indicators = ['ma5', 'ma20', 'rsi', 'macd', 'bb_upper', 'bb_lower', 'volume_ratio']
+        if not all(ind in df.columns for ind in required_indicators):
+            logger.warning("필요한 지표가 데이터에 없습니다. 기술적 지표를 먼저 추가해주세요.")
+            return None
+            
+        # 특성 선택 (피처 엔지니어링)
+        features = pd.DataFrame(index=df.index)
+        # 이동평균선 관련 특성
+        features['ma_ratio_5_20'] = df['ma5'] / df['ma20']
+        features['ma_ratio_5_60'] = df['ma5'] / df['ma60'] if 'ma60' in df.columns else 1.0
+        
+        # 가격 위치 관련 특성
+        features['price_to_ma5'] = df['close'] / df['ma5']
+        features['price_to_ma20'] = df['close'] / df['ma20']
+        
+        # 볼린저 밴드 관련 특성
+        features['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+        features['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle'] if 'bb_middle' in df.columns else 0
+        
+        # RSI 관련 특성
+        features['rsi'] = df['rsi']
+        features['rsi_diff'] = df['rsi'] - df['rsi'].shift(3)
+        
+        # MACD 관련 특성
+        features['macd_hist'] = df['macd'] - df['macd_signal'] if 'macd_signal' in df.columns else df['macd']
+        features['macd_hist_change'] = features['macd_hist'] - features['macd_hist'].shift(1)
+        
+        # 거래량 관련 특성
+        features['volume_ratio'] = df['volume_ratio']
+        features['volume_trend'] = df['volume'].rolling(window=5).mean() / df['volume'].rolling(window=15).mean()
+        
+        # 추세 관련 특성
+        features['close_change_1'] = df['close'].pct_change()
+        features['close_change_5'] = df['close'].pct_change(5)
+        features['close_change_10'] = df['close'].pct_change(10)
+        
+        # 추가 특성 (스토캐스틱 등)
+        if 'stoch_k' in df.columns and 'stoch_d' in df.columns:
+            features['stoch_k'] = df['stoch_k']
+            features['stoch_d'] = df['stoch_d']
+            features['stoch_diff'] = df['stoch_k'] - df['stoch_d']
+        
+        # NaN 값 처리
+        features = features.replace([np.inf, -np.inf], np.nan).dropna()
+        
+        # 특성 목록 저장
+        self.feature_cols = features.columns.tolist()
+        
+        return features
+    
+    def prepare_target(self, df, horizon=3, threshold=0.01):
+        """학습을 위한 타겟 변수 준비"""
+        # n일 후 가격 변화율
+        df['future_return'] = df['close'].shift(-horizon) / df['close'] - 1
+        
+        # 임계값 기준 레이블 생성 (1: 상승, 0: 하락 또는 횡보)
+        df['target'] = (df['future_return'] > threshold).astype(int)
+        
+        return df['target']
+    
+    def train_model(self, df, horizon=3, threshold=0.01, test_size=0.2, save_path=None):
+        """모델 학습 - 과적합 완화"""
+        from sklearn.model_selection import train_test_split
+        from sklearn.ensemble import RandomForestClassifier
+
+        # 특성 및 타겟 준비
+        features = self.prepare_features(df)
+        if features is None:
+            return False
+
+        target = self.prepare_target(df, horizon, threshold)
+        common_index = features.index.intersection(target.dropna().index)
+        X = features.loc[common_index]
+        y = target.loc[common_index]
+
+        # 최소 데이터 수 확인
+        min_data_count = max(100, len(X) * 0.8)  # 최소 100개
+        if len(X) < min_data_count:
+            logger.warning(f"학습 데이터가 부족합니다: {len(X)} 행 (최소 {min_data_count} 필요)")
+            return False
+
+        # 훈련/테스트 분할
+        split_idx = int(len(X) * (1 - test_size))
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+        # 특성 스케일링
+        self.scaler = StandardScaler()
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+
+        # 모델 초기화 - 과적합 방지
+        n_estimators = min(50, max(20, len(X_train) // 10))
+        max_depth = min(5, max(3, len(X_train) // 20))  # 깊이 제한 강화
+        self.model = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            min_samples_split=max(5, len(X_train) // 20),
+            min_samples_leaf=max(2, len(X_train) // 40),
+            class_weight='balanced',  # 클래스 불균형 처리
+            random_state=42
+        )
+
+        try:
+            self.model.fit(X_train_scaled, y_train)
+            train_accuracy = self.model.score(X_train_scaled, y_train)
+            test_accuracy = self.model.score(X_test_scaled, y_test) if len(X_test) > 0 else train_accuracy
+            self.test_accuracy = test_accuracy
+
+            logger.info(f"모델 학습 완료: 훈련 정확도 {train_accuracy:.4f}, 테스트 정확도 {test_accuracy:.4f}")
+
+            # 모델 신뢰도 확인
+            if test_accuracy < 0.75:
+                logger.warning(f"테스트 정확도 {test_accuracy:.4f}가 낮습니다. 모델 사용 주의")
+                return False
+
+            # 특성 중요도 확인 및 낮은 중요도 특성 제거
+            if hasattr(self.model, 'feature_importances_'):
+                importances = self.model.feature_importances_
+                feature_importance = pd.DataFrame({
+                    'Feature': self.feature_cols,
+                    'Importance': importances
+                }).sort_values('Importance', ascending=False)
+                self.feature_cols = feature_importance[feature_importance['Importance'] > 0.05]['Feature'].tolist()
+                logger.debug("특성 중요도 상위 3개:")
+                for i, row in feature_importance.head(3).iterrows():
+                    logger.debug(f"  {row['Feature']}: {row['Importance']:.4f}")
+
+            if save_path:
+                self.save_model(save_path)
+            return True
+
+        except Exception as e:
+            logger.error(f"모델 학습 중 오류: {e}")
+            return False
+    
+    def predict_signals(self, features):
+        """특성 데이터로 신호 예측"""
+        if self.model is None:
+            logger.error("모델이 학습되지 않았습니다")
+            return np.zeros(len(features))
+            
+        # 특성 일관성 검사
+        required_features = set(self.feature_cols) if self.feature_cols else set([
+            'ma_ratio_5_20', 'price_to_ma20', 'rsi', 'bb_position', 
+            'macd_hist', 'volume_ratio'
+        ])
+        
+        available_features = set(features.columns)
+        missing_features = required_features - available_features
+        
+        # 누락된 특성이 있는 경우 처리
+        if missing_features:
+            logger.warning(f"누락된 특성 감지: {missing_features}")
+            features_copy = features.copy()
+            
+            for feature in missing_features:
+                # 특성 유형별 대체 방법
+                if feature == 'ma_ratio_5_20' and 'ma5' in features.columns and 'ma20' in features.columns:
+                    features_copy[feature] = features['ma5'] / features['ma20']
+                elif feature == 'price_to_ma20' and 'close' in features.columns and 'ma20' in features.columns:
+                    features_copy[feature] = features['close'] / features['ma20']
+                elif feature == 'bb_position' and 'close' in features.columns and 'bb_upper' in features.columns and 'bb_lower' in features.columns:
+                    features_copy[feature] = (features['close'] - features['bb_lower']) / (features['bb_upper'] - features['bb_lower'])
+                elif feature == 'macd_hist' and 'macd' in features.columns and 'macd_signal' in features.columns:
+                    features_copy[feature] = features['macd'] - features['macd_signal']
+                elif feature == 'volume_ratio' and 'volume' in features.columns:
+                    # 단순 평균 대비 비율로 근사치 계산
+                    features_copy[feature] = features['volume'] / features['volume'].rolling(window=20).mean()
+                else:
+                    # 안전한 기본값 설정
+                    logger.warning(f"특성 '{feature}' 자동 계산 불가능, 중간값으로 대체")
+                    features_copy[feature] = 0.5  # 중간값으로 대체
+            
+            # 실제 예측에 사용할 특성만 선택
+            prediction_features = features_copy[list(required_features)]
+        else:
+            # 모델이 학습된 특성 컬럼만 선택
+            if self.feature_cols:
+                # 모든 필요 특성이 있는 경우
+                prediction_features = features[self.feature_cols]
+            else:
+                # 특성 목록이 저장되지 않은 경우 기본 특성 사용
+                prediction_features = features[list(required_features)]
+        
+        try:
+            # 결측치 처리
+            prediction_features = prediction_features.fillna(method='ffill').fillna(method='bfill')
+            
+            # 이상치 처리
+            for col in prediction_features.columns:
+                z_scores = (prediction_features[col] - prediction_features[col].mean()) / prediction_features[col].std()
+                outliers = abs(z_scores) > 3
+                if outliers.any():
+                    median_val = prediction_features[col].median()
+                    prediction_features.loc[outliers, col] = median_val
+            
+            # 스케일링
+            scaled_features = self.scaler.transform(prediction_features)
+            
+            # 예측 (클래스 확률)
+            probabilities = self.model.predict_proba(scaled_features)
+            
+            # 매수 확률 (1: 상승 클래스)
+            buy_probabilities = probabilities[:, 1]
+            
+            return buy_probabilities
+            
+        except Exception as e:
+            logger.error(f"예측 중 오류 발생: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return np.zeros(len(features))
+    
+    def generate_signal(self, df, probability_threshold=None):
+        """매매 신호 생성 - 동적 임계값"""
+        features = self.prepare_features(df)
+        if features is None or self.model is None:
+            return pd.Series(0, index=df.index)
+
+        # 동적 임계값 계산 (시장 변동성 기반)
+        if probability_threshold is None:
+            # 예: 최근 20일 가격 변동성(ATR)을 기반으로 임계값 조정
+            atr = (df['high'] - df['low']).rolling(window=20).mean() / df['close']
+            volatility = atr.iloc[-1] if not atr.empty else 0.01
+            probability_threshold = max(0.45, min(0.55, 0.45 + volatility * 2))
+
+        common_index = features.index.intersection(df.index)
+        signals = pd.Series(0, index=df.index)
+
+        if len(common_index) > 0:
+            buy_probabilities = self.predict_signals(features.loc[common_index])
+            signals_subset = pd.Series(0, index=common_index)
+            signals_subset[buy_probabilities > probability_threshold] = 1
+            signals_subset[buy_probabilities < (1 - probability_threshold - 0.05)] = -1
+            signals.loc[common_index] = signals_subset
+
+        return signals
+    
+    def save_model(self, path):
+        """모델 저장"""
+        if self.model is None:
+            logger.error("저장할 모델이 없습니다")
+            return False
+            
+        # 디렉토리 생성
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        # 모델과 스케일러 저장
+        model_data = {
+            'model': self.model,
+            'scaler': self.scaler,
+            'feature_cols': self.feature_cols,
+            'model_type': self.model_type,
+            'test_accuracy': getattr(self, 'test_accuracy', 0.5)
+        }
+        
+        joblib.dump(model_data, path)
+        logger.info(f"모델 저장 완료: {path}")
+        return True
+    
+    def load_model(self, path):
+        """모델 로드"""
+        if not os.path.exists(path):
+            logger.error(f"모델 파일이 존재하지 않습니다: {path}")
+            return False
+            
+        try:
+            model_data = joblib.load(path)
+            self.model = model_data['model']
+            self.scaler = model_data['scaler']
+            self.feature_cols = model_data['feature_cols']
+            self.model_type = model_data.get('model_type', 'random_forest')
+            self.test_accuracy = model_data.get('test_accuracy', 0.5)
+            
+            logger.info(f"모델 로드 완료: {path}")
+            return True
+        except Exception as e:
+            logger.error(f"모델 로드 오류: {e}")
+            return False

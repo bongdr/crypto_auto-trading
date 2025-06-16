@@ -1,0 +1,237 @@
+import pandas as pd
+import numpy as np
+import logging
+from datetime import datetime, timedelta
+import os
+import json
+
+from strategy.base import BaseStrategy
+
+logger = logging.getLogger("sentiment_strategy")
+
+class SentimentStrategy(BaseStrategy):
+    """감정 분석 기반 거래 전략"""
+    
+    def __init__(self, name="감정 분석 전략", params=None):
+        """초기화
+        
+        Args:
+            name (str): 전략 이름
+            params (dict): 전략 파라미터
+        """
+        super().__init__(name)
+        
+        # 기본 파라미터
+        self.params = params or {
+            'sentiment_threshold': 0.2,      # 매수 신호 감정 임계값
+            'sentiment_weight': 0.4,         # 감정 신호 가중치
+            'sentiment_lookback': 3,         # 감정 데이터 참조 일수
+            'extreme_sentiment_threshold': 0.7,  # 극단적 감정 임계값
+            'contrarian_threshold': 0.6,     # 역발상 전략 임계값
+            'use_contrarian': True,          # 역발상 전략 사용 여부
+            'min_news_count': 5              # 최소 뉴스 개수
+        }
+        
+        # 감정 분석 모듈 (더미 - 실제 구현 시 교체)
+        self.sentiment_collector = None
+        self.sentiment_analyzer = None
+        
+        # 캐시 설정
+        self.sentiment_cache = {}
+        self.cache_dir = 'data_cache/sentiment_strategy'
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
+        logger.info(f"{name} 전략 초기화 완료")
+    
+    def _get_recent_sentiment(self, ticker, days=None):
+        """최근 감정 데이터 조회
+        
+        Args:
+            ticker (str): 코인 티커
+            days (int): 조회할 일수
+            
+        Returns:
+            dict: 감정 데이터
+        """
+        days = days or self.params['sentiment_lookback']
+        
+        # 더미 감정 데이터 반환 (실제 구현 시 API 호출로 교체)
+        return {
+            'ticker': ticker,
+            'timestamp': datetime.now().isoformat(),
+            'news': {
+                'cryptopanic': [],
+                'coindesk': [],
+                'total_count': 0
+            },
+            'social': {
+                'reddit': {},
+                'twitter': {}
+            },
+            'market_indicators': {
+                'fear_greed_index': None
+            },
+            'scores': {
+                'overall_score': 0,
+                'news_score': 0,
+                'social_score': 0,
+                'market_score': 0,
+                'components': {}
+            }
+        }
+    
+    def generate_sentiment_indicators(self, ticker, df):
+        """감정 지표 생성
+        
+        Args:
+            ticker (str): 코인 티커
+            df (DataFrame): 가격 데이터
+            
+        Returns:
+            DataFrame: 감정 지표가 추가된 데이터프레임
+        """
+        # 데이터프레임 복사
+        result_df = df.copy()
+        
+        # 감정 데이터 로드
+        sentiment_data = self._get_recent_sentiment(ticker)
+        
+        if not sentiment_data or 'scores' not in sentiment_data:
+            # 감정 데이터가 없으면 중립적인 값으로 설정
+            result_df['sentiment_score'] = 0
+            result_df['sentiment_signal'] = 0
+            result_df['sentiment_trend'] = 0
+            result_df['extreme_sentiment'] = 0
+            return result_df
+        
+        # 감정 점수와 구성요소
+        sentiment_scores = sentiment_data['scores']
+        
+        # 기본 감정 점수 (-1 ~ 1 범위)
+        result_df['sentiment_score'] = sentiment_scores['overall_score']
+        
+        # 뉴스 개수 확인
+        news_count = sentiment_data['news'].get('total_count', 0)
+        
+        # 감정 신호 생성
+        threshold = self.params['sentiment_threshold']
+        extreme_threshold = self.params['extreme_sentiment_threshold']
+        
+        # 기본 감정 신호
+        if news_count >= self.params['min_news_count']:
+            if sentiment_scores['overall_score'] > threshold:
+                result_df['sentiment_signal'] = 1  # 긍정적
+            elif sentiment_scores['overall_score'] < -threshold:
+                result_df['sentiment_signal'] = -1  # 부정적
+            else:
+                result_df['sentiment_signal'] = 0  # 중립적
+        else:
+            # 뉴스가 충분하지 않으면 신호 없음
+            result_df['sentiment_signal'] = 0
+        
+        # 극단적 감정 감지
+        if abs(sentiment_scores['overall_score']) > extreme_threshold:
+            if self.params['use_contrarian']:
+                # 역발상 전략: 극단적 긍정 → 매도, 극단적 부정 → 매수
+                if sentiment_scores['overall_score'] > extreme_threshold:
+                    result_df['extreme_sentiment'] = -1  # 과도한 긍정 → 매도 신호
+                else:
+                    result_df['extreme_sentiment'] = 1   # 과도한 부정 → 매수 신호
+            else:
+                # 일반 전략: 극단적 감정 방향과 동일하게
+                result_df['extreme_sentiment'] = np.sign(sentiment_scores['overall_score'])
+        else:
+            result_df['extreme_sentiment'] = 0
+        
+        # 감정 추세 (기본값 0 - 실제 구현 시 감정 데이터 히스토리 필요)
+        result_df['sentiment_trend'] = 0
+        
+        return result_df
+    
+    def generate_signal(self, df):
+        """매매 신호 생성
+        
+        Args:
+            df (DataFrame): 가격 데이터
+            
+        Returns:
+            Series: 매매 신호 (1: 매수, -1: 매도, 0: 홀딩)
+        """
+        # 티커 결정
+        ticker = df.name if hasattr(df, 'name') else 'KRW-BTC'
+        
+        # 감정 지표 추가
+        df_with_sentiment = self.generate_sentiment_indicators(ticker, df)
+        
+        # 기본 기술적 신호 생성
+        technical_signal = self._generate_technical_signal(df)
+        
+        # 감정 기반 신호
+        sentiment_signal = df_with_sentiment['sentiment_signal']
+        extreme_sentiment = df_with_sentiment['extreme_sentiment']
+        
+        # 신호 결합
+        combined_signal = pd.Series(0, index=df.index)
+        
+        # 기술적 신호와 감정 신호 조합
+        weight_tech = 1 - self.params['sentiment_weight']
+        weight_sentiment = self.params['sentiment_weight']
+        
+        for i in range(len(df)):
+            # 극단적 감정 있는 경우 우선 적용
+            if extreme_sentiment.iloc[i] != 0:
+                combined_signal.iloc[i] = extreme_sentiment.iloc[i]
+            else:
+                # 기술적 신호와 감정 신호 가중 평균
+                tech_value = technical_signal.iloc[i] if i < len(technical_signal) else 0
+                sent_value = sentiment_signal.iloc[i]
+                
+                weighted_signal = (tech_value * weight_tech) + (sent_value * weight_sentiment)
+                
+                # 신호 이진화
+                if weighted_signal > 0.3:
+                    combined_signal.iloc[i] = 1
+                elif weighted_signal < -0.3:
+                    combined_signal.iloc[i] = -1
+        
+        return combined_signal
+    
+    def _generate_technical_signal(self, df):
+        """기본 기술적 신호 생성"""
+        # 기술적 지표 확인
+        if not all(col in df.columns for col in ['close', 'ma5', 'ma20', 'rsi']):
+            # 필요한 기술적 지표가 없는 경우, 추가
+            try:
+                from models.feature_engineering import FeatureEngineer
+                fe = FeatureEngineer()
+                df = fe.add_indicators(df)
+            except ImportError:
+                logger.warning("FeatureEngineer를 찾을 수 없습니다. 중립 신호를 반환합니다.")
+                return pd.Series(0, index=df.index)
+        
+        # 시그널 초기화
+        signal = pd.Series(0, index=df.index)
+        
+        try:
+            # 이동평균 교차
+            ma_cross_up = (df['ma5'].shift(1) < df['ma20'].shift(1)) & (df['ma5'] > df['ma20'])
+            ma_cross_down = (df['ma5'].shift(1) > df['ma20'].shift(1)) & (df['ma5'] < df['ma20'])
+            
+            # RSI 매수/매도 구간
+            rsi_oversold = df['rsi'] < 30
+            rsi_overbought = df['rsi'] > 70
+            
+            # 매수 신호
+            buy_signal = ma_cross_up | rsi_oversold
+            signal[buy_signal] = 1
+            
+            # 매도 신호
+            sell_signal = ma_cross_down | rsi_overbought
+            signal[sell_signal] = -1
+            
+        except Exception as e:
+            logger.error(f"기술적 신호 생성 중 오류: {e}")
+            # 오류 발생 시 중립 신호 반환
+            signal = pd.Series(0, index=df.index)
+        
+        return signal

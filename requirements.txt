@@ -1,0 +1,14 @@
+# 기본 라이브러리 (보안 버전)
+pyupbit==0.2.31
+pandas>=1.5.0,<3.0.0
+numpy>=1.21.0,<2.0.0
+scikit-learn>=1.1.0,<2.0.0
+matplotlib>=3.5.0,<4.0.0
+
+# 환경 및 보안
+python-dotenv>=0.19.0,<2.0.0
+cryptography>=3.4.8,<42.0.0
+
+# 유틸리티
+requests>=2.28.0,<3.0.0
+joblib>=1.1.0,<2.0.0

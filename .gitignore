@@ -1,0 +1,15 @@
+.env
+.env.local
+.env.*.local
+__pycache__/
+logs/
+data_cache/
+saved_models/
+*.log
+*.pkl
+.DS_Store
+
+# 백업 파일들 (API 키 포함)
+.env.backup
+*.env.backup
+.env.*

@@ -1,0 +1,229 @@
+from datetime import datetime, timedelta
+from config.settings import STOP_LOSS_THRESHOLD, TAKE_PROFIT_THRESHOLD, TRAILING_STOP_ACTIVATION, TRAILING_STOP_DISTANCE
+from utils.logger import setup_logger
+
+logger = setup_logger("risk_manager")
+
+class RiskManager:
+    """리스크 관리 모듈"""
+    
+    def __init__(self):
+        """초기화"""
+        self.stop_levels = {}  # {ticker: {'stop_loss': price, 'take_profit': price, 'trailing_stop': price}}
+        self.max_prices = {}  # {ticker: 고점 가격}
+        
+    def check_trade(self, ticker, price, position, position_info, signal, account_info=None):
+        """매매 가능 여부 확인 및 리스크 파라미터 계산"""
+        # price는 이미 float 값입니다 - 딕셔너리로 취급하지 않도록 주의
+        
+        # 기본 응답
+        result = {
+            'allow_trade': True,
+            'reason': None,
+            'position_size': 0.3,
+            'stop_loss': None,
+            'take_profit': None,
+            'trailing_stop': None
+        }
+        
+        # 여기서 price를 직접 사용합니다
+        if price is None:
+            result['allow_trade'] = False
+            result['reason'] = 'no_price'
+            return result
+        
+        # 1. 현재 포지션이 없는 경우 (매수 고려)
+        if position == 0 and signal == 1:
+            # 포지션 크기 계산
+            if account_info:
+                # 잔고 비율 기반 포지션 크기 조정
+                # 과도한 투자를 방지하기 위해 자산 크기에 따라 투자 비율 감소
+                balance = account_info.get_balance()
+                total_value = account_info.get_portfolio_value({ticker: price})
+                
+                if total_value > 0:
+                    # 이미 투자된 비율 계산
+                    invested_ratio = 1 - (balance / total_value)
+                    
+                    # 추가 투자 크기 조정 (이미 많이 투자했다면 포지션 크기 감소)
+                    if invested_ratio > 0.5:  # 50% 이상 이미 투자됨
+                        result['position_size'] = max(0.1, 0.3 - (invested_ratio - 0.5))  # 최소 10%
+                        logger.debug(f"자산 분산을 위해 포지션 크기 조정: {result['position_size']:.2f}")
+                
+            # 시장 변동성 확인 (필요시)
+            # TODO: 시장 변동성에 따른 포지션 크기 추가 조정
+            
+            # 정해진 거래 시간대인지 확인 (필요시)
+            current_hour = datetime.now().hour
+            if 0 <= current_hour < 5:  # 새벽 시간대 (0시-5시)
+                # 변동성이 높은 시간대는 투자 비율 감소
+                result['position_size'] *= 0.7
+                logger.debug(f"변동성이 높은 시간대로 포지션 크기 감소: {result['position_size']:.2f}")
+            
+        # 2. 현재 포지션이 있는 경우 (매도 또는 홀딩 관리)
+        elif position == 1:
+            # 포지션 정보가 없으면 기본값 사용
+            if not position_info:
+                position_info = {'entry_price': price, 'entry_time': datetime.now() - timedelta(days=1)}
+            
+            entry_price = position_info.get('entry_price', price)
+            entry_time = position_info.get('entry_time', datetime.now() - timedelta(days=1))
+            # 손절 및 익절 계산
+            stop_loss_price = entry_price * (1 - STOP_LOSS_THRESHOLD)
+            take_profit_price = entry_price * (1 + TAKE_PROFIT_THRESHOLD)
+            
+            # 추적 손절매 계산
+            current_profit_percent = (price / entry_price) - 1
+            
+            # 고점 기록
+            if ticker not in self.max_prices or price > self.max_prices[ticker]:
+                self.max_prices[ticker] = price
+            
+            max_price = self.max_prices.get(ticker, price)
+            
+            # 일정 수익 이상 발생한 경우 추적 손절매 활성화
+            if current_profit_percent >= TRAILING_STOP_ACTIVATION:
+                trailing_stop_price = max_price * (1 - TRAILING_STOP_DISTANCE)
+                
+                # 기존 손절가보다 높은 경우에만 업데이트
+                if trailing_stop_price > stop_loss_price:
+                    stop_loss_price = trailing_stop_price
+                    logger.debug(f"{ticker} 추적 손절매 설정: {stop_loss_price:,.0f}원 (고점 대비 {TRAILING_STOP_DISTANCE*100:.1f}%)")
+            
+            # 신호가 매도(-1)일 때 모든 손절/익절 무시하고 매도 허용
+            if signal == -1:
+                result['allow_trade'] = True
+            # 손절가에 도달한 경우
+            elif price <= stop_loss_price:
+                result['allow_trade'] = True
+                result['reason'] = 'stop_loss'
+            # 익절가에 도달한 경우
+            elif price >= take_profit_price:
+                result['allow_trade'] = True
+                result['reason'] = 'take_profit'
+            # 홀딩 유지 (매도 신호 없음)
+            else:
+                result['allow_trade'] = False
+                result['reason'] = 'hold_position'
+            
+            # 손절/익절 정보 저장
+            result['stop_loss'] = stop_loss_price
+            result['take_profit'] = take_profit_price
+            
+            # 최소 보유 시간 확인 (너무 자주 거래 방지)
+            holding_time = datetime.now() - entry_time
+            if holding_time.total_seconds() < 3600 and signal == -1:  # 1시간 이내 매도 신호
+                # 큰 손실이 아니라면 최소 보유 시간 적용
+                if price > entry_price * 0.97:  # 3% 이내 손실
+                    result['allow_trade'] = False
+                    result['reason'] = 'minimum_holding_time'
+                    logger.debug(f"{ticker} 최소 보유 시간 미달: {holding_time.seconds//60}분 (최소 60분)")
+        
+        # 3. 전체 자산 배분 고려
+        if account_info and result['allow_trade'] and position == 0 and signal == 1:
+            # 이미 너무 많은 종목에 투자되었는지 확인
+            holdings_count = sum(1 for amount in account_info.holdings.values() if amount > 0)
+            balance = account_info.get_balance()
+            total_value = account_info.get_portfolio_value({ticker: price})
+            
+            # 현금 비율이 20% 미만이면 추가 매수 제한
+            if balance / total_value < 0.2 and holdings_count >= 3:
+                result['allow_trade'] = False
+                result['reason'] = 'cash_reserve_low'
+                logger.debug(f"현금 보유량 부족: {balance/total_value:.1%} (최소 20%)")
+        
+        # 4. 최근 매매 결과 고려 (필요시)
+        # TODO: 최근 연속 손실 시 포지션 크기 감소 로직 추가
+        
+        return result
+    
+    def set_manual_stop_loss(self, ticker, price):
+        """수동 손절가 설정"""
+        if ticker not in self.stop_levels:
+            self.stop_levels[ticker] = {}
+            
+        self.stop_levels[ticker]['stop_loss'] = price
+        logger.info(f"{ticker} 수동 손절가 설정: {price:,.0f}원")
+        
+    def set_manual_take_profit(self, ticker, price):
+        """수동 익절가 설정"""
+        if ticker not in self.stop_levels:
+            self.stop_levels[ticker] = {}
+            
+        self.stop_levels[ticker]['take_profit'] = price
+        logger.info(f"{ticker} 수동 익절가 설정: {price:,.0f}원")
+        
+    def reset_trailing_stop(self, ticker):
+        """특정 코인의 추적 손절매 리셋"""
+        if ticker in self.max_prices:
+            del self.max_prices[ticker]
+        
+        if ticker in self.stop_levels and 'trailing_stop' in self.stop_levels[ticker]:
+            del self.stop_levels[ticker]['trailing_stop']
+            
+        logger.info(f"{ticker} 추적 손절매 리셋")
+    
+    def calculate_position_size(self, balance, ticker, price, volatility=None):
+        """자산, 변동성 등을 고려한 적정 포지션 크기 계산"""
+        # 기본 포지션 크기 (자산의 30%)
+        position_size = 0.3
+        
+        # 자산 크기에 따른 조정
+        if balance > 10000000:  # 1천만원 이상
+            position_size = 0.2  # 20%로 감소
+        elif balance < 500000:  # 50만원 미만
+            position_size = 0.5  # 50%로 증가
+        
+        # 변동성 고려 (낮은 변동성은 더 큰 포지션, 높은 변동성은 더 작은 포지션)
+        if volatility:
+            if volatility > 0.05:  # 일 변동성 5% 이상 (높음)
+                position_size *= 0.7
+            elif volatility < 0.02:  # 일 변동성 2% 미만 (낮음)
+                position_size *= 1.2
+        
+        # 최대/최소 포지션 크기 제한
+        position_size = max(0.1, min(0.5, position_size))
+        
+        return position_size
+    
+    def calculate_kelly_criterion(self, win_rate, win_loss_ratio):
+        """켈리 기준으로 최적 배팅 비율 계산"""
+        # win_rate: 승률 (0.0 ~ 1.0)
+        # win_loss_ratio: 평균 수익 / 평균 손실 비율
+        
+        kelly = win_rate - ((1 - win_rate) / win_loss_ratio)
+        
+        # 음수일 경우 0 반환 (투자하지 않음)
+        if kelly <= 0:
+            return 0
+            
+        # 켈리 기준의 절반 사용 (보수적 접근)
+        kelly_half = kelly * 0.5
+        
+        # 최대 투자 비율 제한
+        return min(0.5, kelly_half)
+    
+    def update_strategy(self, ticker, price, profit_loss_data=None):
+        """최근 거래 결과를 바탕으로 전략 파라미터 업데이트"""
+        # profit_loss_data: 최근 거래의 수익/손실 데이터
+        
+        if not profit_loss_data:
+            return
+            
+        # 최근 연속 손실 확인
+        consecutive_losses = profit_loss_data.get('consecutive_losses', 0)
+        
+        # 연속 손실이 3회 이상이면 리스크 감소
+        if consecutive_losses >= 3:
+            logger.warning(f"{ticker} 연속 {consecutive_losses}회 손실, 리스크 감소 적용")
+            
+            # 손절 수준 타이트하게 조정
+            self.stop_levels[ticker] = self.stop_levels.get(ticker, {})
+            self.stop_levels[ticker]['custom_stop_loss_ratio'] = STOP_LOSS_THRESHOLD * 0.7
+            
+            # 익절 수준 낮게 조정
+            self.stop_levels[ticker]['custom_take_profit_ratio'] = TAKE_PROFIT_THRESHOLD * 0.7
+            
+            return True
+            
+        return False
